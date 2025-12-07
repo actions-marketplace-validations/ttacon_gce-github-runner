@@ -146,7 +146,7 @@ do
       ;;
     accelerator)
       accelerator=$OPTLARG
-      ;;      
+      ;;
     h|help)
       usage
       exit 0
@@ -199,12 +199,14 @@ function start_vm {
   echo "The new GCE VM will be ${VM_ID}"
 
   startup_script="
-	# Get the node's hostname
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-EOF > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
 	sleep ${shutdown_timeout}
-	gcloud compute instances delete $(hostname) --zone=$machine_zone --quiet
+	# ensure the active gcloud account in the shutdown script is the same one configured on instance creation
+	gcloud config set account \$(gcloud auth list --filter=status:ACTIVE --format=\"value(account)\")
+	instance=\$(hostname)
+	gcloud compute instances delete \\\${instance} --zone=$machine_zone --quiet
 	EOF
 
 	cat <<-EOF > /etc/systemd/system/shutdown.service
@@ -222,20 +224,22 @@ function start_vm {
 
 	cat <<-EOF > /usr/bin/gce_runner_shutdown.sh
 	#!/bin/sh
-	echo \"✅ Self deleting $(hostname) in ${machine_zone} in ${shutdown_timeout} seconds ...\"
+	instance=\$(hostname)
+	echo \"✅ Self deleting \\\${instance} in ${machine_zone} in ${shutdown_timeout} seconds ...\"
 	# We tear down the machine by starting the systemd service that was registered by the startup script
 	systemctl start shutdown.service
 	EOF
 
 	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
 	echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh" >.env
-	gcloud compute instances add-labels $(hostname) --zone=${machine_zone} --labels=gh_ready=0 && \\
+	instance=\$(hostname)
+	gcloud compute instances add-labels \${instance} --zone=${machine_zone} --labels=gh_ready=0 && \\
 	RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended ${ephemeral_flag} --disableupdate && \\
 	./svc.sh install && \\
 	./svc.sh start && \\
-	gcloud compute instances add-labels $(hostname) --zone=${machine_zone} --labels=gh_ready=1
+	gcloud compute instances add-labels \${instance} --zone=${machine_zone} --labels=gh_ready=1
 	# 3 days represents the max workflow runtime. This will shutdown the instance if everything else fails.
-	nohup sh -c \"sleep 3d && gcloud --quiet compute instances delete $(hostname) --zone=${machine_zone}\" > /dev/null &
+	nohup sh -c \"sleep 3d && gcloud --quiet compute instances delete \${instance} --zone=${machine_zone}\" > /dev/null &
   "
 
   if $actions_preinstalled ; then
@@ -244,14 +248,23 @@ function start_vm {
     cd /actions-runner
     $startup_script"
   else
-    echo "✅ Startup script will install GitHub Actions"
+    if [[ "$runner_ver" = "latest" ]]; then
+      latest_ver=$(curl -sL --fail -H "Authorization: Bearer ${token}" \
+                  https://api.github.com/repos/actions/runner/releases/latest | \
+                  jq -r '.tag_name' | sed -e 's/^v//') || {
+        echo "❌ Failed to fetch latest runner version"; exit 1; }
+      runner_ver="$latest_ver"
+      echo "✅ runner_ver=latest is specified. v$latest_ver is detected as the latest version."
+    fi
+    echo "✅ Startup script will install GitHub Actions v$runner_ver"
     if $arm ; then
       startup_script="#!/bin/bash
       mkdir /actions-runner
       cd /actions-runner
       curl -o actions-runner-linux-arm64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-arm64-${runner_ver}.tar.gz
       tar xzf ./actions-runner-linux-arm64-${runner_ver}.tar.gz
-      ./bin/installdependencies.sh && \\
+      ./bin/installdependencies.sh
+
       $startup_script"
     else
       startup_script="#!/bin/bash
@@ -259,13 +272,16 @@ function start_vm {
       cd /actions-runner
       curl -o actions-runner-linux-x64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-x64-${runner_ver}.tar.gz
       tar xzf ./actions-runner-linux-x64-${runner_ver}.tar.gz
-      ./bin/installdependencies.sh && \\
+      ./bin/installdependencies.sh
+
       $startup_script"
     fi
   fi
 
-  gcloud compute instances bulk create "${VM_ID}-#" \
+  gcloud compute instances bulk create \
+    --name-pattern="${VM_ID}-#" \
     --count=${num_instances} \
+    --min-count=${num_instances} \
     --zone=${machine_zone} \
     ${disk_size_flag} \
     ${boot_disk_type_flag} \
@@ -281,11 +297,17 @@ function start_vm {
     ${accelerator} \
     ${maintenance_policy_flag} \
     --labels=gh_ready=0,vm_id=${VM_ID} \
-    --metadata=startup-script="$startup_script" \
-    && echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+    --metadata=startup-script="$startup_script"
+ 
+  echo "label=${VM_ID}" >> $GITHUB_OUTPUT
 
   safety_off
-  launched_instances=$(gcloud compute instances list --filter "labels.owner=platform" --format='get(name)')
+  launched_instances=$(gcloud compute instances list --filter "labels.vm_id=${VM_ID}" --format='get(name)')
+  if [ -z "$launched_instances" ]; then
+    echo "Failed to launch VMs"
+    exit 1
+  fi
+
   for instance in $launched_instances; do
     while (( i++ < 60 )); do
       GH_READY=$(gcloud compute instances describe ${instance} --zone=${machine_zone} --format='json(labels)' | jq -r .labels.gh_ready)
@@ -300,6 +322,16 @@ function start_vm {
     else
       echo "Waited 5 minutes for ${instance}, without luck, deleting ${instance} ..."
       gcloud --quiet compute instances delete ${instance} --zone=${machine_zone}
+
+      # NOTE: if one instance fails and then we exit, we also need to clean up any other
+      # launched instances
+      for extra_instance in $launched_instances; do
+        if [[ $extra_instance != $instance ]]; then
+          echo "Deleting ${extra_instance} ..."
+          gcloud --quiet compute instances delete ${extra_instance} --zone=${machine_zone}
+        fi
+      done
+
       exit 1
     fi
   done
